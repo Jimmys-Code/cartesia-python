@@ -1,6 +1,6 @@
 import ollama
 
-llm = "llama3"
+llm = "llama3.1"
 
 def get_ollama_api(messages, max_tokens=1000, stream=True, model=llm, keep_alive=-1):
     # Ensure messages is a list of dictionaries
