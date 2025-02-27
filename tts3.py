@@ -16,6 +16,7 @@ class TtsManager:
         self.voice_id = None
         self.model_id = None
         self.rate = None
+        self.ws = None
         
         # Queue for audio chunks
         self.audio_queue = queue.Queue()
@@ -55,8 +56,16 @@ class TtsManager:
             channels=1,
             rate=self.rate,
             output=True,
-            frames_per_buffer=2048
+            frames_per_buffer=1024
         )
+        
+        # "Warm up" the audio system to eliminate initial jitter
+        silence = np.zeros(512, dtype=np.float32)
+        self.stream.write(silence.tobytes())
+        
+        # Set up a persistent WebSocket connection
+        print("Establishing WebSocket connection...")
+        self.ws = self.client.tts.websocket()
         
         # Start the playback thread
         self.playback_thread = threading.Thread(
@@ -145,9 +154,6 @@ class TtsManager:
             return
             
         try:
-            # Create a new websocket for each request to avoid statefulness issues
-            ws = self.client.tts.websocket()
-            
             # Generate a new context ID
             context_id = str(uuid.uuid4())
             self.current_context_id = context_id
@@ -156,8 +162,8 @@ class TtsManager:
             initial_frames = []
             buffer_size = 3
             
-            # Request the audio
-            for chunk in ws.send(
+            # Request the audio using the persistent websocket
+            for chunk in self.ws.send(
                 model_id=self.model_id,
                 transcript=text,
                 voice={"mode": "id", "id": self.voice_id},
@@ -171,6 +177,13 @@ class TtsManager:
                 # Check if interruption was requested
                 if self.interrupt_requested.is_set():
                     print(f"Interruption detected, stopping speech for context {context_id}")
+                    
+                    # Remove the context from websocket to properly clean up
+                    try:
+                        self.ws._remove_context(context_id)
+                    except:
+                        pass
+                        
                     break
                 
                 # Process the audio
@@ -180,7 +193,7 @@ class TtsManager:
                         initial_frames.append(chunk.audio)
                         
                         if len(initial_frames) >= buffer_size:
-                            # Add all buffered frames to the queue
+                            # Add all buffered frames to the queue at once
                             for frame in initial_frames:
                                 if not self.interrupt_requested.is_set():
                                     self.audio_queue.put(frame)
@@ -188,12 +201,6 @@ class TtsManager:
                         # Add frame directly to the queue
                         if not self.interrupt_requested.is_set():
                             self.audio_queue.put(chunk.audio)
-                
-            # Close the websocket when done
-            try:
-                ws.close()
-            except:
-                pass
                 
         except Exception as e:
             print(f"Error generating audio: {e}")
@@ -213,6 +220,10 @@ class TtsManager:
         
         if self.p:
             self.p.terminate()
+            
+        # Close the WebSocket connection
+        if self.ws:
+            self.ws.close()
         
         print("TTS system shut down.")
 
