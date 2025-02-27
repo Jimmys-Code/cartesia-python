@@ -86,16 +86,20 @@ def main():
         # Main interaction loop
         while True:
             # Get user input
-            user_text = input("\nEnter text to speak (or type 'exit' to quit): ")
+            # user_text = input("\nEnter text to speak (or type 'exit' to quit): ")
             
-            if user_text.lower() == 'exit':
-                break
+            # if user_text.lower() == 'exit':
+            #     break
                 
-            if user_text.strip():
-                print("Speaking...")
-                # Process the text immediately
-                process_text_to_speech(ws, p, stream, voice_id, model_id, rate, user_text)
-    
+            # if user_text.strip():
+            print("Speaking...")
+            # Process the text immediately
+            process_text_to_speech(ws, p, stream, voice_id, model_id, rate, 'testing 1 2 3')
+            print("Done speaking.") 
+            process_text_to_speech(ws, p, stream, voice_id, model_id, rate, 'testing 1 2 3')
+            print("Done speaking. 2")
+            process_text_to_speech(ws, p, stream, voice_id, model_id, rate, 'testing 1 2 3')
+
     except KeyboardInterrupt:
         print("\nInterrupted by user")
     
