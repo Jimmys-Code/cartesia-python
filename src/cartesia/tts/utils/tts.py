@@ -62,3 +62,15 @@ def concat_audio_segments(
 
     except Exception as e:
         raise ValueError(f"Failed to concatenate audio segments: {str(e)}")
+
+def _construct_tts_request_cancel(
+    *,
+    context_id: str
+):
+
+    tts_request = {
+        "cancel": True,
+        "context_id": context_id,
+    }
+
+    return tts_request

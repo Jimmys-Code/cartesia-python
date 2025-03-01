@@ -14,7 +14,7 @@ except ImportError:
 
 from iterators import TimeoutIterator  # type: ignore
 
-from cartesia.tts.requests import TtsRequestVoiceSpecifierParams
+from cartesia.tts.requests import TtsRequestVoiceSpecifierParams 
 from cartesia.tts.requests.output_format import OutputFormatParams
 from cartesia.tts.types import (
     WebSocketResponse,
@@ -30,6 +30,7 @@ from cartesia.tts.types import (
 
 from ..core.pydantic_utilities import parse_obj_as
 from .types.generation_request import GenerationRequest
+from .utils.tts import _construct_tts_request_cancel
 
 
 class _TTSContext:
@@ -428,3 +429,23 @@ class TtsWebsocket:
         if context_id not in self._contexts:
             self._contexts.add(context_id)
         return _TTSContext(context_id, self)
+
+    def cancel(self, context_id: str) -> bool:
+        """Cancel an ongoing TTS request for the given context_id.
+        
+        Args:
+            context_id: The context ID of the request to cancel. If not specified,
+            request will fail
+                       
+        Returns:
+            bool: True if the request was cancelled, False otherwise.
+        """
+        self.connect()
+
+        if context_id is None:
+            return False
+
+        request_body = _construct_tts_request_cancel(context_id=context_id)
+        self.websocket.send(json.dumps(request_body))
+        return True
+

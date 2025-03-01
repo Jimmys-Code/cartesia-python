@@ -5,8 +5,10 @@ import pyaudio
 import threading
 import queue
 import uuid
+import json
 
 from cartesia import Cartesia
+from cartesia.tts.requests.output_format import OutputFormat_RawParams
 
 class TtsManager:
     def __init__(self):
@@ -18,15 +20,13 @@ class TtsManager:
         self.model_id = None
         self.rate = None
         
-        # Audio buffer and playback control
-        self.audio_queue = queue.Queue()
-        self.active_generation_id = None
-        self.generation_lock = threading.Lock()
-        
-        # Thread management
-        self.playback_thread = None
-        self.generation_threads = {}
-        self.stop_all = threading.Event()
+        # For managing speech and interruption
+        self.text_queue = queue.Queue()
+        self.current_context_id = None
+        self.context_lock = threading.Lock()  # To safely update current_context
+        self.worker_thread = None
+        self.stop_event = threading.Event()
+        self.is_speaking = threading.Event()
         
         # Initialize components
         self.initialize_tts()
@@ -61,199 +61,180 @@ class TtsManager:
         silence = np.zeros(512, dtype=np.float32)
         self.stream.write(silence.tobytes())
         
-        # Set up a single persistent WebSocket connection
+        # Set up a single WebSocket connection
         print("Establishing WebSocket connection...")
         self.ws = self.client.tts.websocket()
         
-        # Start the playback thread
-        self.playback_thread = threading.Thread(
-            target=self.playback_worker,
+        # Start worker thread
+        self.worker_thread = threading.Thread(
+            target=self.tts_worker,
             daemon=True
         )
-        self.playback_thread.start()
+        self.worker_thread.start()
         
         print("TTS system ready!")
     
-    def playback_worker(self):
-        """Worker thread that plays audio from the queue."""
-        while not self.stop_all.is_set():
-            try:
-                # Get audio chunk from queue with timeout
-                gen_id, audio_chunk = self.audio_queue.get(timeout=0.1)
-                
-                # Only play if this is from the active generation
-                with self.generation_lock:
-                    is_active = gen_id == self.active_generation_id
-                
-                if is_active:
-                    self.stream.write(audio_chunk)
-                
-                self.audio_queue.task_done()
-            except queue.Empty:
-                # No problem, just continue waiting
-                pass
-            except Exception as e:
-                print(f"Error in playback: {e}")
-    
     def speak(self, text):
-        """Speak the given text."""
-        # Generate a unique ID for this generation
-        gen_id = str(uuid.uuid4())
+        """Queue text to be spoken."""
+        self.text_queue.put((text, None))  # None means create a new context
         
-        # Set this as the active generation
-        with self.generation_lock:
-            # Clear out any previous generations
-            self.clear_queue()
-            self.active_generation_id = gen_id
-        
-        # Start the generation in a new thread
-        generation_thread = threading.Thread(
-            target=self.generate_audio,
-            args=(text, gen_id),
-            daemon=True
-        )
-        
-        # Store the thread reference
-        self.generation_threads[gen_id] = generation_thread
-        
-        # Start the thread
-        generation_thread.start()
-    
     def interrupt_and_speak(self, text):
-        """Interrupt current speech and speak new text."""
-        print("Interrupting current speech...")
+        """Stop current speech and speak this text instead."""
+        # Cancel current context if there is one
+        with self.context_lock:
+            if self.current_context_id:
+                try:
+                    # IMPORTANT: Send explicit cancellation request to the server
+                    # This is the key difference from the original implementation
+                    cancel_request = {
+                        "context_id": self.current_context_id,
+                        "cancel": True
+                    }
+                    try:
+                        self.ws.websocket.send(json.dumps(cancel_request))
+                        print(f"Sent cancellation request for context {self.current_context_id}")
+                    except Exception as e:
+                        print(f"Error sending cancellation request: {e}")
+                    
+                    # Then remove the context from client-side tracking
+                    self.ws._remove_context(self.current_context_id)
+                    print(f"Removed context {self.current_context_id} from client tracking")
+                except Exception as e:
+                    print(f"Error cancelling context: {e}")
         
-        # Simply start a new speech - it will automatically become the active one
-        # and the previous one will stop playing
-        self.speak(text)
-    
-    def clear_queue(self):
-        """Clear all pending audio from the queue."""
-        try:
-            while not self.audio_queue.empty():
-                self.audio_queue.get_nowait()
-                self.audio_queue.task_done()
-        except Exception:
-            pass
-    
-    def generate_audio(self, text, gen_id):
-        """Generate audio for the given text."""
-        if not text:
-            return
-            
-        try:
-            # Use a separate context ID for the WebSocket
-            context_id = str(uuid.uuid4())
-            
-            # Buffer initial frames for smoother start
-            initial_frames = []
-            buffer_size = 2
-            
-            # Generate the audio
-            for chunk in self.ws.send(
-                model_id=self.model_id,
-                transcript=text,
-                voice={"mode": "id", "id": self.voice_id},
-                context_id=context_id,
-                output_format={
-                    "container": "raw",
-                    "encoding": "pcm_f32le", 
-                    "sample_rate": self.rate
-                },
-            ):
-                # Check if this generation is still active
-                with self.generation_lock:
-                    is_active = gen_id == self.active_generation_id
+        # Clear the queue
+        while not self.text_queue.empty():
+            try:
+                self.text_queue.get_nowait()
+                self.text_queue.task_done()
+            except queue.Empty:
+                break
+        
+        # Add new text to queue with explicit instruction to create new context
+        self.text_queue.put((text, "new_context"))
+        
+    def tts_worker(self):
+        """Background worker that processes text from the queue."""
+        min_initial_frames = 3
+        
+        while not self.stop_event.is_set():
+            try:
+                # Wait for text in queue with timeout to allow checking stop_event
+                try:
+                    text, context_action = self.text_queue.get(timeout=0.5)
+                except queue.Empty:
+                    continue
                 
-                # If no longer active, stop processing
-                if not is_active:
-                    print(f"Generation {gen_id} is no longer active, stopping")
-                    break
-                
-                # Process the audio chunk
-                if chunk.audio:
-                    if len(initial_frames) < buffer_size:
-                        # Buffer initial frames
-                        initial_frames.append(chunk.audio)
-                        
-                        if len(initial_frames) >= buffer_size:
-                            # Send all initial frames to the queue
-                            for frame in initial_frames:
-                                with self.generation_lock:
-                                    if gen_id == self.active_generation_id:
-                                        self.audio_queue.put((gen_id, frame))
+                try:
+                    # Create a new context if needed
+                    new_context_id = None
+                    if context_action == "new_context" or self.current_context_id is None:
+                        new_context_id = str(uuid.uuid4())
                     else:
-                        # Add frame directly to the queue
-                        with self.generation_lock:
-                            if gen_id == self.active_generation_id:
-                                self.audio_queue.put((gen_id, chunk.audio))
+                        new_context_id = self.current_context_id
+                    
+                    # Update current context ID
+                    with self.context_lock:
+                        self.current_context_id = new_context_id
+                    
+                    print(f"Using context: {new_context_id}")
+                    
+                    # Collect initial frames to avoid "startup" jitter
+                    initial_frames = []
+                    collected_enough = False
+                    self.is_speaking.set()
+                    
+                    # Generate and stream audio
+                    for chunk in self.ws.send(
+                        model_id=self.model_id,
+                        transcript=text,
+                        voice={"mode": "id", "id": self.voice_id},
+                        context_id=new_context_id,
+                        output_format={
+                            "container": "raw",
+                            "encoding": "pcm_f32le", 
+                            "sample_rate": self.rate
+                        },
+                    ):
+                        if not collected_enough:
+                            initial_frames.append(chunk.audio)
+                            if len(initial_frames) >= min_initial_frames:
+                                collected_enough = True
+                                # Play all initial frames at once
+                                for frame in initial_frames:
+                                    self.stream.write(frame)
+                        else:
+                            self.stream.write(chunk.audio)
+                except Exception as e:
+                    print(f"Error during speech generation: {e}")
                 
-        except Exception as e:
-            print(f"Error generating audio: {e}")
-        finally:
-            # Clean up thread reference
-            if gen_id in self.generation_threads:
-                del self.generation_threads[gen_id]
+                self.is_speaking.clear()
+                self.text_queue.task_done()
+                
+            except Exception as e:
+                print(f"Unexpected error in TTS worker: {e}")
     
     def shutdown(self):
         """Clean up resources."""
-        print("Shutting down TTS system...")
+        self.stop_event.set()
         
-        # Signal all threads to stop
-        self.stop_all.set()
-        
-        # Close the WebSocket connection
-        if self.ws:
+        # Clear the queue and add sentinel to ensure worker exits
+        while not self.text_queue.empty():
             try:
-                self.ws.close()
-            except Exception as e:
-                print(f"Error closing WebSocket: {e}")
+                self.text_queue.get_nowait()
+                self.text_queue.task_done()
+            except queue.Empty:
+                break
         
-        # Close audio stream
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=2.0)
+            
         if self.stream:
             self.stream.stop_stream()
             self.stream.close()
-        
+            
         if self.p:
             self.p.terminate()
-        
+            
+        if self.ws:
+            self.ws.close()
+            
         print("TTS system shut down.")
-
 
 def main():
     # Create TTS Manager
     tts = TtsManager()
     
     try:
-        print("System ready! Press Enter to start the demo.")
-        input()
+        # Demo regular speaking
+        print("Speaking first sentence...")
         
-        # Speak a long first sentence
-        print("Speaking long sentence...")
-        tts.speak("This is a very long sentence that demonstrates the text-to-speech system with instant response. You should notice that the speech starts immediately with no delay, and when the interruption happens two seconds from now, it will immediately switch to the new text without any jumbling or overlapping of audio.")
+        input(">")
+        tts.speak("Hello, I am speaking in a background thread.")
+        input("")
+
+
+        tts.interrupt_and_speak("I've interrupted the previous speech to say something new and important.")
+        time.sleep(4)
         
-        # Wait 2 seconds then interrupt
-        time.sleep(2)
-        print("Interrupting after 2 seconds...")
-        tts.interrupt_and_speak("I have successfully interrupted the previous speech with this new sentence. There should be no overlap or jumbling of the audio.")
-        
-        # Allow time for the second sentence to complete
-        time.sleep(5)
+        # Demo speaking after interruption
+        print("Speaking after interruption...")
+        tts.speak("And now I'm speaking normally again after the interruption.")
+        time.sleep(4)
         
         # Interactive demo
-        print("\nInteractive demo - press Enter at any time to interrupt")
+        print("\nInteractive demo - Press Enter to continue")
+        input()
         
-        # Start speaking another long text
-        tts.speak("This is another demonstration of the text-to-speech system with a very long monologue that will continue until you decide to press the Enter key. At that point, the system should immediately interrupt this speech and start playing the new speech without any overlapping audio or jumbling of sentences. The system is designed to provide clean interruptions for use cases like virtual assistants and interactive applications where responsiveness is critical.")
+        print("1. Speaking long text - type anything and press Enter to interrupt")
+        tts.speak("This is a very long sentence that I'm going to keep speaking for a while so that you have time to interrupt me. I'll keep talking and talking because that's what I do. I can talk all day about various things like the weather, technology, books, movies, or anything else that comes to mind. The purpose of this long text is to demonstrate immediate interruption capabilities.")
         
         # Wait for user input to interrupt
-        input()
-        tts.interrupt_and_speak("You interrupted me by pressing Enter! The interruption should have happened immediately and cleanly without any jumbling of audio.")
+        user_input = input()
+        tts.interrupt_and_speak(f"You interrupted me to say: {user_input}")
+        time.sleep(3)
         
-        # Wait for final speech to complete
-        time.sleep(4)
-        print("\nDemo complete! Press Enter to exit.")
-        input()
+        print("Demo complete!")
 
     except KeyboardInterrupt:
         print("\nInterrupted by user")

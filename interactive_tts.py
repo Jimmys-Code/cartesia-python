@@ -198,7 +198,7 @@ def main():
         
         input(">")
         tts.speak("Hello, I am speaking in a background thread.")
-        time.sleep(2)
+        time.sleep(1)
 
         
         # Demo regular queuing
